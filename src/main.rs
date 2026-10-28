@@ -169,6 +169,16 @@ fn try_analyze(source: &str) -> syn::Result<Vec<Finding>> {
         }
     }
     impl<'ast> Visit<'ast> for Loops {
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            let outer = std::mem::replace(&mut self.depth, 0);
+            visit::visit_impl_item_fn(self, node);
+            self.depth = outer;
+        }
+        fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+            let outer = std::mem::replace(&mut self.depth, 0);
+            visit::visit_trait_item_fn(self, node);
+            self.depth = outer;
+        }
         fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
             let outer = std::mem::replace(&mut self.depth, 0);
             visit::visit_item_fn(self, node);
@@ -378,6 +388,21 @@ fn looks_like_char_literal(chars: &[char], index: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn methods_have_independent_depth_and_restore_outer_depth() {
+        for item in [
+            "struct Local; impl Local { fn run(ys: &[u8]) { for _ in ys {} } }",
+            "trait Local { fn run(ys: &[u8]) { for _ in ys {} } }",
+        ] {
+            let source =
+                format!("fn outer(xs: &[u8]) {{ for _ in xs {{ {item} for _ in xs {{}} }} }}");
+            let findings = analyze(&source);
+            assert_eq!(findings.len(), 3);
+            assert_eq!(findings[0].message, "loop may grow as O(N)");
+            assert_eq!(findings[1].message, "loop may grow as O(N)");
+            assert!(findings[2].message.contains("O(N^2)"));
+        }
+    }
     #[test]
     fn local_functions_have_independent_loop_depth() {
         let findings = analyze(

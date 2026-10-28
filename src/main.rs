@@ -99,28 +99,95 @@ fn print_help() {
 }
 
 fn collect_rust_files(path: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Ok(());
+    }
     if path.is_file() {
         if path.extension().is_some_and(|extension| extension == "rs") {
-            files.push(path.to_path_buf());
+            files.push(fs::canonicalize(path)?);
         }
         return Ok(());
     }
+    let mut failure = None;
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let child = entry.path();
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
         if child.is_dir() {
             let name = entry.file_name();
-            if name != "target" && name != ".git" {
-                collect_rust_files(&child, files)?;
+            if name != "target"
+                && name != ".git"
+                && let Err(error) = collect_rust_files(&child, files)
+            {
+                eprintln!("nayuta: {}: {error}", child.display());
+                failure = Some(error);
             }
         } else if child.extension().is_some_and(|extension| extension == "rs") {
-            files.push(child);
+            files.push(fs::canonicalize(child)?);
         }
     }
-    Ok(())
+    failure.map_or(Ok(()), Err)
 }
 
 fn analyze(source: &str) -> Vec<Finding> {
+    use syn::visit::{self, Visit};
+    struct Loops {
+        depth: usize,
+        findings: Vec<Finding>,
+    }
+    impl Loops {
+        fn enter(&mut self, span: proc_macro2::Span) {
+            self.depth += 1;
+            self.findings.push(Finding {
+                line: span.start().line,
+                message: if self.depth == 1 {
+                    "loop may grow as O(N)".into()
+                } else {
+                    format!(
+                        "loop nesting depth is {}; work may grow as O(N^{})",
+                        self.depth, self.depth
+                    )
+                },
+            });
+        }
+    }
+    impl<'ast> Visit<'ast> for Loops {
+        fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+            self.visit_expr(&node.expr);
+            self.enter(node.for_token.span);
+            self.visit_block(&node.body);
+            self.depth -= 1;
+        }
+        fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+            self.enter(node.while_token.span);
+            visit::visit_expr_while(self, node);
+            self.depth -= 1;
+        }
+        fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+            self.enter(node.loop_token.span);
+            visit::visit_expr_loop(self, node);
+            self.depth -= 1;
+        }
+    }
+    let mut visitor = Loops {
+        depth: 0,
+        findings: Vec::new(),
+    };
+    match syn::parse_file(source) {
+        Ok(file) => visitor.visit_file(&file),
+        Err(_) => {
+            if let Ok(block) = syn::parse_str::<syn::Block>(&format!("{{{source}}}")) {
+                visitor.visit_block(&block);
+            }
+        }
+    }
+    visitor.findings
+}
+
+#[allow(dead_code)]
+fn legacy_analyze(source: &str) -> Vec<Finding> {
     let tokens = tokenize(source);
     let mut findings = Vec::new();
     let mut blocks = Vec::<Block>::new();
@@ -291,6 +358,38 @@ fn looks_like_char_literal(chars: &[char], index: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn issue_regressions() {
+        let results = analyze(
+            "struct A; impl Clone for A { fn clone(&self) -> Self { for i in 0..1 {} A } }",
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message, "loop may grow as O(N)");
+        assert!(analyze("fn call<F>(f: F) where F: for<'a> Fn(&'a str) { f(\"x\"); }").is_empty());
+        let results = analyze(
+            "fn f(v: &[Vec<i32>]) { for row in v.iter().filter(|r| { !r.is_empty() }) { for x in row {} } }",
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results[1].message.contains("O(N^2)"));
+        assert!(analyze("fn f(x: bool) { let r#loop = 1; if x { let _ = r#loop; } }").is_empty());
+        let source = r####"fn f() { let a = br"C:\"; let b = cr"x\"; for i in 0..10 {} }"####;
+        assert_eq!(analyze(source).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_symlink_cycles() {
+        let directory = std::env::temp_dir().join(format!("nayuta-test-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("sample.rs"), "fn f() {}").unwrap();
+        std::os::unix::fs::symlink(&directory, directory.join("cycle")).unwrap();
+        let mut files = Vec::new();
+        collect_rust_files(&directory, &mut files).unwrap();
+        assert_eq!(files.len(), 1);
+        fs::remove_file(directory.join("cycle")).unwrap();
+        fs::remove_file(directory.join("sample.rs")).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
     #[test]
     fn reports_linear_and_nested_loops() {
         let source = r#"for user in users {

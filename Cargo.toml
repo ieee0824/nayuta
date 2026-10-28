@@ -6,3 +6,5 @@ license = "MIT"
 description = "A lightweight static analyzer for finding O(N) and higher complexity candidates in Rust"
 
 [dependencies]
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }

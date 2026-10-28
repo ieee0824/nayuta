@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+mod memory;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Finding {
@@ -29,6 +30,9 @@ struct Block {
 }
 
 fn main() -> ExitCode {
+    if env::args_os().nth(1).is_some_and(|arg| arg == "memory") {
+        return memory::run(env::args_os().skip(2).collect());
+    }
     let mut fail_on_findings = false;
     let mut paths = Vec::new();
     for arg in env::args().skip(1) {
@@ -102,7 +106,7 @@ fn main() -> ExitCode {
 
 fn print_help() {
     println!(
-        "nayuta - find likely high-complexity code in Rust\n\nUsage: nayuta [--fail] [PATH ...]\n\nRecursively scans PATH (the current directory by default).\n--fail  exit with status 1 when a finding is reported"
+        "nayuta - find likely high-complexity code in Rust\n\nUsage: nayuta [--fail] [PATH ...]\n       nayuta memory --help\n\nRecursively scans PATH (the current directory by default).\n--fail  exit with status 1 when a finding is reported"
     );
 }
 

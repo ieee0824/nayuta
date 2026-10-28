@@ -65,7 +65,15 @@ fn main() -> ExitCode {
     for file in &files {
         match fs::read_to_string(file) {
             Ok(source) => {
-                for finding in analyze(&source) {
+                let findings = match try_analyze(&source) {
+                    Ok(findings) => findings,
+                    Err(error) => {
+                        eprintln!("nayuta: {}: parse error: {error}", file.display());
+                        had_error = true;
+                        continue;
+                    }
+                };
+                for finding in findings {
                     println!(
                         "{}:{}: complexity: {}",
                         file.display(),
@@ -124,14 +132,21 @@ fn collect_rust_files(path: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<
                 eprintln!("nayuta: {}: {error}", child.display());
                 failure = Some(error);
             }
-        } else if child.extension().is_some_and(|extension| extension == "rs") {
+        } else if entry.file_type()?.is_file()
+            && child.extension().is_some_and(|extension| extension == "rs")
+        {
             files.push(fs::canonicalize(child)?);
         }
     }
     failure.map_or(Ok(()), Err)
 }
 
+#[cfg(test)]
 fn analyze(source: &str) -> Vec<Finding> {
+    try_analyze(source).expect("valid test source")
+}
+
+fn try_analyze(source: &str) -> syn::Result<Vec<Finding>> {
     use syn::visit::{self, Visit};
     struct Loops {
         depth: usize,
@@ -154,6 +169,11 @@ fn analyze(source: &str) -> Vec<Finding> {
         }
     }
     impl<'ast> Visit<'ast> for Loops {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            let outer = std::mem::replace(&mut self.depth, 0);
+            visit::visit_item_fn(self, node);
+            self.depth = outer;
+        }
         fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
             self.visit_expr(&node.expr);
             self.enter(node.for_token.span);
@@ -177,13 +197,13 @@ fn analyze(source: &str) -> Vec<Finding> {
     };
     match syn::parse_file(source) {
         Ok(file) => visitor.visit_file(&file),
-        Err(_) => {
-            if let Ok(block) = syn::parse_str::<syn::Block>(&format!("{{{source}}}")) {
-                visitor.visit_block(&block);
-            }
+        Err(error) => {
+            let block =
+                syn::parse_str::<syn::Block>(&format!("{{{source}}}")).map_err(|_| error)?;
+            visitor.visit_block(&block);
         }
     }
-    visitor.findings
+    Ok(visitor.findings)
 }
 
 #[allow(dead_code)]
@@ -358,6 +378,15 @@ fn looks_like_char_literal(chars: &[char], index: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_functions_have_independent_loop_depth() {
+        let findings = analyze(
+            "fn f(xs: &[u8]) { for _ in xs { fn helper(ys: &[u8]) { for _ in ys {} } for _ in xs {} } }",
+        );
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[1].message, "loop may grow as O(N)");
+        assert!(findings[2].message.contains("O(N^2)"));
+    }
     #[test]
     fn issue_regressions() {
         let results = analyze(

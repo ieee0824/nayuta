@@ -76,6 +76,17 @@ fn report_command(path: &std::path::Path) -> Command {
     command
 }
 
+fn reserve_recording(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 fn execute(mode: Mode) -> Result<(), String> {
     if mode == Mode::Help {
         println!("{HELP}");
@@ -89,10 +100,7 @@ fn execute(mode: Mode) -> Result<(), String> {
     let path = match mode {
         Mode::Record { output, command } => {
             // Reserve the destination atomically so perf never overwrites user data.
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&output)
+            reserve_recording(&output)
                 .map_err(|e| format!("cannot create {}: {e}", output.display()))?;
             eprintln!("Recording memory samples to {}", output.display());
             let status = Command::new("perf")
@@ -146,6 +154,23 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn recording_is_private_and_existing_content_is_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("nayuta-private-{}", std::process::id()));
+        let mut file = reserve_recording(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o077, 0);
+        use std::io::Write;
+        file.write_all(b"sentinel").unwrap();
+        drop(file);
+        assert_eq!(
+            reserve_recording(&path).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"sentinel");
+        std::fs::remove_file(path).unwrap();
+    }
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
     }

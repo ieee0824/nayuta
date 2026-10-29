@@ -173,6 +173,30 @@ fn try_analyze(source: &str) -> syn::Result<Vec<Finding>> {
         }
     }
     impl<'ast> Visit<'ast> for Loops {
+        fn visit_expr_repeat(&mut self, node: &'ast syn::ExprRepeat) {
+            for attribute in &node.attrs {
+                self.visit_attribute(attribute);
+            }
+            self.visit_expr(&node.expr);
+            let outer = std::mem::replace(&mut self.depth, 0);
+            self.visit_expr(&node.len);
+            self.depth = outer;
+        }
+        fn visit_generic_argument(&mut self, node: &'ast syn::GenericArgument) {
+            if let syn::GenericArgument::Const(expression) = node {
+                let outer = std::mem::replace(&mut self.depth, 0);
+                self.visit_expr(expression);
+                self.depth = outer;
+            } else {
+                visit::visit_generic_argument(self, node);
+            }
+        }
+        fn visit_type_array(&mut self, node: &'ast syn::TypeArray) {
+            self.visit_type(&node.elem);
+            let outer = std::mem::replace(&mut self.depth, 0);
+            self.visit_expr(&node.len);
+            self.depth = outer;
+        }
         fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
             let outer = std::mem::replace(&mut self.depth, 0);
             visit::visit_item_const(self, node);
@@ -417,6 +441,32 @@ fn looks_like_char_literal(chars: &[char], index: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn array_lengths_and_const_arguments_have_independent_depth() {
+        let value = "{ let mut i = 0; while i < 4 { i += 1; } i }";
+        for statement in [
+            format!("let _ = [0u8; {value}];"),
+            format!("let _ = Marker::<{value}>;"),
+            format!("let _: [u8; {value}];"),
+        ] {
+            let source = format!(
+                "struct Marker<const N: usize>; fn outer(xs: &[u8]) {{ for _ in xs {{ {statement} for _ in xs {{}} }} }}"
+            );
+            let findings = analyze(&source);
+            assert_eq!(findings.len(), 3, "{statement}");
+            assert_eq!(findings[1].message, "loop may grow as O(N)", "{statement}");
+            assert!(findings[2].message.contains("O(N^2)"), "{statement}");
+        }
+    }
+    #[test]
+    fn repeat_element_preserves_runtime_depth() {
+        let findings = analyze(
+            "fn outer(xs: &[u8]) { for _ in xs { let _ = [{ for _ in xs {} 0u8 }; 4]; for _ in xs {} } }",
+        );
+        assert_eq!(findings.len(), 3);
+        assert!(findings[1].message.contains("O(N^2)"));
+        assert!(findings[2].message.contains("O(N^2)"));
+    }
     #[test]
     fn constant_evaluation_has_independent_depth() {
         let value = "{ let mut i = 0; while i < 4 { i += 1; } i }";

@@ -173,6 +173,31 @@ fn try_analyze(source: &str) -> syn::Result<Vec<Finding>> {
         }
     }
     impl<'ast> Visit<'ast> for Loops {
+        fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+            let outer = std::mem::replace(&mut self.depth, 0);
+            visit::visit_item_const(self, node);
+            self.depth = outer;
+        }
+        fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+            let outer = std::mem::replace(&mut self.depth, 0);
+            visit::visit_item_static(self, node);
+            self.depth = outer;
+        }
+        fn visit_expr_const(&mut self, node: &'ast syn::ExprConst) {
+            let outer = std::mem::replace(&mut self.depth, 0);
+            visit::visit_expr_const(self, node);
+            self.depth = outer;
+        }
+        fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+            let outer = std::mem::replace(&mut self.depth, 0);
+            visit::visit_impl_item_const(self, node);
+            self.depth = outer;
+        }
+        fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
+            let outer = std::mem::replace(&mut self.depth, 0);
+            visit::visit_trait_item_const(self, node);
+            self.depth = outer;
+        }
         fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
             let outer = std::mem::replace(&mut self.depth, 0);
             visit::visit_impl_item_fn(self, node);
@@ -392,6 +417,28 @@ fn looks_like_char_literal(chars: &[char], index: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn constant_evaluation_has_independent_depth() {
+        let value = "{ let mut i = 0; while i < 4 { i += 1; } i }";
+        for declaration in [
+            format!("const VALUE: usize = {value};"),
+            format!("static VALUE: usize = {value};"),
+            format!("let _ = const {value};"),
+            format!("struct Local; impl Local {{ const VALUE: usize = {value}; }}"),
+            format!("trait Local {{ const VALUE: usize = {value}; }}"),
+        ] {
+            let source = format!(
+                "fn outer(xs: &[u8]) {{ for _ in xs {{ {declaration} for _ in xs {{}} }} }}"
+            );
+            let findings = analyze(&source);
+            assert_eq!(findings.len(), 3, "{declaration}");
+            assert_eq!(
+                findings[1].message, "loop may grow as O(N)",
+                "{declaration}"
+            );
+            assert!(findings[2].message.contains("O(N^2)"), "{declaration}");
+        }
+    }
     #[test]
     fn methods_have_independent_depth_and_restore_outer_depth() {
         for item in [

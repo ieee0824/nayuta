@@ -1,6 +1,53 @@
 use std::{fs, process::Command};
 
 #[test]
+fn deferred_bodies_have_independent_loop_depth() {
+    let dir = std::env::temp_dir().join(format!("nayuta-deferred-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("deferred.rs");
+    fs::write(
+        &path,
+        r#"fn main() {
+    let n = std::env::args().nth(1).unwrap_or("100".into()).parse::<usize>().unwrap();
+    for _ in 0..n {
+        let _unused = || { for _ in 0..n {} };
+        let _future = async { for _ in 0..n {} };
+        let _nested = || { for _ in 0..n { for _ in 0..n {} } };
+        let _nested_future = async { for _ in 0..n { for _ in 0..n {} } };
+        for _ in 0..n {}
+    }
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_nayuta"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    fs::remove_dir_all(dir).unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let findings: Vec<_> = stdout
+        .lines()
+        .filter_map(|line| line.split_once(": complexity: "))
+        .map(|(location, message)| (location.rsplit(':').next().unwrap(), message))
+        .collect();
+    assert_eq!(
+        findings,
+        vec![
+            ("3", "loop may grow as O(N)"),
+            ("4", "loop may grow as O(N)"),
+            ("5", "loop may grow as O(N)"),
+            ("6", "loop may grow as O(N)"),
+            ("6", "loop nesting depth is 2; work may grow as O(N^2)"),
+            ("7", "loop may grow as O(N)"),
+            ("7", "loop nesting depth is 2; work may grow as O(N^2)"),
+            ("8", "loop nesting depth is 2; work may grow as O(N^2)"),
+        ]
+    );
+}
+
+#[test]
 fn parse_failure_reports_error_and_continues() {
     let dir = std::env::temp_dir().join(format!("nayuta-parse-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();

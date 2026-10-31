@@ -173,6 +173,17 @@ fn try_analyze(source: &str) -> syn::Result<Vec<Finding>> {
         }
     }
     impl<'ast> Visit<'ast> for Loops {
+        // Deferred bodies are analyzed independently of their definition site.
+        fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+            let outer = std::mem::replace(&mut self.depth, 0);
+            visit::visit_expr_closure(self, node);
+            self.depth = outer;
+        }
+        fn visit_expr_async(&mut self, node: &'ast syn::ExprAsync) {
+            let outer = std::mem::replace(&mut self.depth, 0);
+            visit::visit_expr_async(self, node);
+            self.depth = outer;
+        }
         fn visit_expr_repeat(&mut self, node: &'ast syn::ExprRepeat) {
             for attribute in &node.attrs {
                 self.visit_attribute(attribute);

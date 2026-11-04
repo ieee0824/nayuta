@@ -98,7 +98,7 @@ fn main() -> ExitCode {
                 };
                 for finding in findings {
                     println!(
-                        "{}:{}: complexity: {}",
+                        "{}:{}: complexity: {} (syntactic heuristic; assumes independent N-sized iterations; amortization and deduplication are not analyzed)",
                         file.display(),
                         finding.line,
                         finding.message

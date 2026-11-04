@@ -29,8 +29,8 @@ Read and parse errors also cause a nonzero exit status. Analysis continues for o
 ## Example output
 
 ```text
-src/example.rs:12: complexity: loop may grow as O(N)
-src/example.rs:18: complexity: loop nesting depth is 2; work may grow as O(N^2)
+src/example.rs:12: complexity: loop may grow as O(N) (syntactic heuristic; assumes independent N-sized iterations; amortization and deduplication are not analyzed)
+src/example.rs:18: complexity: loop nesting depth is 2; work may grow as O(N^2) (syntactic heuristic; assumes independent N-sized iterations; amortization and deduplication are not analyzed)
 ```
 
 ## Memory-access profiling on Linux
@@ -74,3 +74,5 @@ Direct synchronous calls are followed transitively across scanned module files. 
 `flat_map` and `flatten` add one degree per expansion, assuming each inner sequence also scales with N. Direct and mutual recursion propagate a conditional risk candidate to callers: for example, `potential O(N^2) or worse if recursion depth scales with N` when linear traversal is present. Recursion without traversal starts at an O(N) candidate. This assumes linear recursion depth; it is not a proven upper or lower bound and may not apply to halving recurrences; recurrence solving and termination proofs are not implemented.
 
 External crates, trait dispatch, type inference, glob imports, chained re-exports, `#[path]`, cfg evaluation, function pointers, function-name shadowing and iterator variables are unsupported. Only scanned files are indexed. Ambiguous definitions are not selected, and unresolved call costs are not composed.
+
+Diagnostics use a syntactic heuristic assuming independent N-sized iterations. Shared work budgets, seen-guard deduplication, amortized complexity, and relationships between input sizes are not analyzed. For example, graph traversal with a seen guard can take expected O(V+E) time under expected constant-time hashing while still producing an O(N^2) nested-loop candidate.

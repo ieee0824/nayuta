@@ -134,3 +134,30 @@ fn follows_calls_across_module_files() {
         "{stdout}"
     );
 }
+
+#[test]
+fn seen_worklist_explanations_preserve_candidates_and_state_assumptions() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/seen_worklist.rs");
+    let output = Command::new(env!("CARGO_BIN_EXE_nayuta"))
+        .arg("--fail")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("call to walk may grow as O(N^4) (syntactic heuristic"));
+    let notes: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.contains("deduplicated worklist"))
+        .collect();
+    assert_eq!(notes.len(), 2);
+    assert!(notes[0].contains(":6: complexity:"));
+    assert!(notes[0].contains("expected O(V + E) per call"));
+    assert!(notes[1].contains(":19: complexity:"));
+    assert!(notes[1].contains("O(G + sum_r(V_r + E_r))"));
+    for note in notes {
+        assert!(note.contains("assuming valid vertex IDs, a fixed graph, expected constant-time hashing and amortized vector growth"));
+        assert!(!note.contains("deduplication are not analyzed"));
+    }
+}

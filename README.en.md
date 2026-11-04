@@ -75,4 +75,12 @@ Direct synchronous calls are followed transitively across scanned module files. 
 
 External crates, trait dispatch, type inference, glob imports, chained re-exports, `#[path]`, cfg evaluation, function pointers, function-name shadowing and iterator variables are unsupported. Only scanned files are indexed. Ambiguous definitions are not selected, and unresolved call costs are not composed.
 
-Diagnostics use a syntactic heuristic assuming independent N-sized iterations. Shared work budgets, seen-guard deduplication, amortized complexity, and relationships between input sizes are not analyzed. For example, graph traversal with a seen guard can take expected O(V+E) time under expected constant-time hashing while still producing an O(N^2) nested-loop candidate.
+Structural degree candidates use a syntactic heuristic assuming independent N-sized iterations. These candidates do not account for shared work budgets, deduplication, amortized complexity, or relationships between input sizes. For example, graph traversal with a seen guard can take expected O(V+E) time under expected constant-time hashing while still producing an O(N^2) nested-loop candidate.
+
+### Conditional seen-guard traversal explanations
+
+Functions matching the [supported example](tests/fixtures/seen_worklist.rs) receive an additional `deduplicated worklist candidate: expected O(V + E) per call` explanation. The function creates a local `Vec` and `HashSet`, pops vertices, and scans each adjacency list only after a successful insertion. V counts reachable vertices; E counts their adjacency entries, including duplicate edges. The explanation assumes valid vertex IDs, a fixed graph, expected constant-time hashing, and amortized vector growth.
+
+The exact `scan_groups` wrapper calling a recognized function in the same file also receives `O(G + sum_r(V_r + E_r))`: G counts groups including empty ones, R counts roots/calls, and the sum ranges over R calls. Each call starts with a fresh seen set; work is not shared across roots.
+
+Recognition uses a closed syntax pattern. Extra work, set resets/removals, different keys, unknown calls or aliases, shadowed names, and glob imports fall back to structural diagnostics. This is not general amortized, type, or effect analysis. See [supported syntax, fallback rules, and validation](docs/seen-worklist.md).

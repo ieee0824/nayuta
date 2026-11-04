@@ -29,8 +29,8 @@ cargo run -- --fail src
 ## 出力例
 
 ```text
-src/example.rs:12: complexity: loop may grow as O(N)
-src/example.rs:18: complexity: loop nesting depth is 2; work may grow as O(N^2)
+src/example.rs:12: complexity: loop may grow as O(N) (syntactic heuristic; assumes independent N-sized iterations; amortization and deduplication are not analyzed)
+src/example.rs:18: complexity: loop nesting depth is 2; work may grow as O(N^2) (syntactic heuristic; assumes independent N-sized iterations; amortization and deduplication are not analyzed)
 ```
 
 ## Linuxでのメモリアクセス計測
@@ -59,3 +59,5 @@ nayuta memory --input run.data
 まだ区別しないため、検出結果はレビューの入り口として利用してください。型注釈付きの引数・ローカル変数と `self` について固有メソッドを解決します。`flat_map` / `flatten` は各内側の要素数も N に比例すると仮定し、一段ごとに次数を加えます。再帰・相互再帰は検出し、呼び出し元にもリスク候補を伝播します。例えば線形走査を伴う再帰は `potential O(N^2) or worse if recursion depth scales with N` と表示します。これは「再帰の深さも N に比例する場合、二乗以上の可能性」という条件付きのヒューリスティックです。走査のない再帰は `O(N)` 候補とし、一律に二乗とは扱いません。入力が半減する再帰などでは前提が成立しないため、厳密な上界・下界を意味しません。漸化式の解法や終了性の証明は行いません。
 
 外部クレート、トレイト経由の呼び出し、型推論、glob import、多段の再エクスポート、`#[path]`、cfg の評価、関数ポインタ、変数に保存したイテレーターは未対応です。関数名のシャドーイングは考慮しません。解析対象に含まれないモジュールは読み込みません。同名の複数定義は解決せず、未解決の呼び出しのコストは合成しません。メモリ計測はLinuxのperfを利用します。
+
+診断は各反復が独立に N に比例するという構文上の推定です。共有の走査量、seen guard による重複除去、償却計算量、入力サイズ間の関係は解析しません。例えば seen guard 付きグラフ探索は、ハッシュ操作の期待定数時間を仮定すれば O(V+E) でも、二重ループとして O(N^2) 候補を報告します。

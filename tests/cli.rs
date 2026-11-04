@@ -30,7 +30,7 @@ fn deferred_bodies_have_independent_loop_depth() {
     let findings: Vec<_> = stdout
         .lines()
         .filter_map(|line| line.split_once(": complexity: "))
-        .map(|(location, message)| (location.rsplit(':').next().unwrap(), message))
+        .map(|(location, message)| (location.rsplit(':').next().unwrap(), message.strip_suffix(" (syntactic heuristic; assumes independent N-sized iterations; amortization and deduplication are not analyzed)").expect("each diagnostic must explain its assumptions")))
         .collect();
     assert_eq!(
         findings,

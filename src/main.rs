@@ -336,6 +336,7 @@ fn analyze_with_index(
                     | "any"
                     | "all"
                     | "find"
+                    | "find_map"
                     | "position"
             ) && iterator_chain(&node.receiver)
             {
@@ -913,6 +914,48 @@ mod tests {
                 .iter()
                 .any(|f| f.message == "call to mid may grow as O(N^2)")
         );
+    }
+
+    #[test]
+    fn find_map_consumes_one_traversal_even_with_adaptors() {
+        for chain in ["xs.iter()", "xs.iter().map(|x| x).filter(|x| **x > 0)"] {
+            let findings = analyze(&format!(
+                "fn lookup(xs: &[u8]) -> Option<u8> {{ {chain}.find_map(|x| (*x == 42).then_some(*x)) }}"
+            ));
+            assert_eq!(findings.len(), 1, "{chain}");
+            assert_eq!(findings[0].message, "iterator consumption may grow as O(N)");
+        }
+    }
+
+    #[test]
+    fn find_map_composes_outer_loops_and_callback_work() {
+        let outer =
+            analyze("fn lookup(xs: &[u8]) { for _ in xs { xs.iter().find_map(|x| Some(*x)); } }");
+        assert_eq!(outer.len(), 2);
+        assert_eq!(outer[1].message, "iterator consumption may grow as O(N^2)");
+
+        let callback_loop = analyze(
+            "fn lookup(xs: &[u8]) { xs.iter().find_map(|x| { for _ in xs {} Some(*x) }); }",
+        );
+        assert_eq!(callback_loop.len(), 2);
+        assert_eq!(
+            callback_loop[0].message,
+            "iterator consumption may grow as O(N)"
+        );
+        assert!(callback_loop[1].message.contains("O(N^2)"));
+
+        let callback_call = analyze(
+            "fn scan(xs: &[u8]) { for _ in xs {} } fn lookup(xs: &[u8]) { xs.iter().find_map(|x| { scan(xs); Some(*x) }); }",
+        );
+        assert_eq!(callback_call.len(), 3);
+        assert_eq!(callback_call[2].message, "call to scan may grow as O(N^2)");
+    }
+
+    #[test]
+    fn find_map_requires_an_iterator_origin() {
+        assert!(analyze(
+            "struct Lookup; impl Lookup { fn find_map(&self) -> Option<u8> { None } } fn lookup(value: &Lookup) { value.find_map(); }"
+        ).is_empty());
     }
 
     #[test]

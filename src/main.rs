@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 mod memory;
+mod symbols;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Finding {
@@ -65,11 +66,29 @@ fn main() -> ExitCode {
     files.sort();
     files.dedup();
 
+    let parsed_files: Vec<_> = files
+        .iter()
+        .filter_map(|path| {
+            let source = fs::read_to_string(path).ok()?;
+            Some((path.clone(), syn::parse_file(&source).ok()?))
+        })
+        .collect();
+    let index = symbols::Index::build(&parsed_files);
     let mut count = 0;
     for file in &files {
         match fs::read_to_string(file) {
             Ok(source) => {
-                let findings = match try_analyze(&source) {
+                let findings = match analyze_with_index(
+                    &source,
+                    Some((
+                        &index,
+                        index
+                            .modules
+                            .get(file)
+                            .map(String::as_str)
+                            .unwrap_or("root"),
+                    )),
+                ) {
                     Ok(findings) => findings,
                     Err(error) => {
                         eprintln!("nayuta: {}: parse error: {error}", file.display());
@@ -150,15 +169,125 @@ fn analyze(source: &str) -> Vec<Finding> {
     try_analyze(source).expect("valid test source")
 }
 
+#[cfg(test)]
 fn try_analyze(source: &str) -> syn::Result<Vec<Finding>> {
+    analyze_with_index(source, None)
+}
+fn analyze_with_index(
+    source: &str,
+    context: Option<(&symbols::Index, &str)>,
+) -> syn::Result<Vec<Finding>> {
     use syn::visit::{self, Visit};
-    struct Loops {
+    struct Loops<'a> {
+        functions: &'a symbols::Index,
+        module: String,
+        owner: Option<String>,
+        types: std::collections::HashMap<String, String>,
+        recursive: bool,
+        active: Vec<String>,
+        max_depth: usize,
         depth: usize,
         findings: Vec<Finding>,
     }
-    impl Loops {
+    impl Loops<'_> {
+        fn bind_signature(&mut self, sig: &syn::Signature) {
+            self.types.clear();
+            for arg in &sig.inputs {
+                if let syn::FnArg::Typed(arg) = arg
+                    && let syn::Pat::Ident(pat) = &*arg.pat
+                    && let Some(name) = type_name(&arg.ty)
+                {
+                    self.types.insert(
+                        pat.ident.to_string(),
+                        self.functions.qualify(&self.module, &name),
+                    );
+                }
+            }
+            if let Some(owner) = &self.owner {
+                self.types.insert("self".into(), owner.clone());
+            }
+        }
+        fn call(&mut self, key: &str, span: proc_macro2::Span) {
+            let Some(defs) = self.functions.functions.get(key) else {
+                return;
+            };
+            if defs.len() != 1 || defs[0].sig.asyncness.is_some() {
+                return;
+            }
+            if self.active.iter().any(|x| x == key) {
+                self.recursive = true;
+                self.findings.push(Finding {
+                    line: span.start().line,
+                    message: format!(
+                        "recursive call to {key}; recursion risk (see caller estimate)"
+                    ),
+                });
+                return;
+            }
+            let function = &defs[0];
+            let mut callee = Loops {
+                functions: self.functions,
+                module: function.module.clone(),
+                owner: function.owner.clone(),
+                types: Default::default(),
+                recursive: false,
+                active: self.active.clone(),
+                max_depth: 0,
+                depth: 0,
+                findings: Vec::new(),
+            };
+            callee.active.push(key.into());
+            callee.bind_signature(&function.sig);
+            callee.visit_block(&function.block);
+            if callee.recursive {
+                self.recursive = true;
+                let work_degree = self.depth + callee.max_depth;
+                self.max_depth = self.max_depth.max(work_degree);
+                self.findings.push(Finding {
+                    line: span.start().line,
+                    message: format!(
+                        "call to {key} reaches recursion; potential {} or worse if recursion depth scales with N (heuristic, not a proven bound)",
+                        order(work_degree + 1)
+                    ),
+                });
+            } else if callee.max_depth > 0 {
+                let degree = self.depth + callee.max_depth;
+                self.max_depth = self.max_depth.max(degree);
+                let name = key.rsplit("::").next().unwrap();
+                self.findings.push(Finding {
+                    line: span.start().line,
+                    message: format!("call to {name} may grow as {}", order(degree)),
+                });
+            }
+        }
+        fn visit_callback(&mut self, expr: &syn::Expr) {
+            if let syn::Expr::Closure(closure) = expr {
+                self.visit_expr(&closure.body);
+            } else {
+                self.visit_expr(expr);
+            }
+        }
+        fn visit_chain(&mut self, expr: &syn::Expr) {
+            if let syn::Expr::Paren(p) = expr {
+                self.visit_chain(&p.expr);
+            } else if let syn::Expr::MethodCall(call) = expr {
+                let expansion = usize::from(matches!(
+                    call.method.to_string().as_str(),
+                    "flat_map" | "flatten"
+                ));
+                self.depth -= expansion;
+                self.visit_chain(&call.receiver);
+                for arg in &call.args {
+                    self.visit_callback(arg);
+                }
+                self.depth += expansion;
+            } else {
+                self.visit_expr(expr);
+            }
+        }
         fn enter(&mut self, span: proc_macro2::Span) {
             self.depth += 1;
+            self.max_depth = self.max_depth.max(self.depth);
             self.findings.push(Finding {
                 line: span.start().line,
                 message: if self.depth == 1 {
@@ -172,17 +301,123 @@ fn try_analyze(source: &str) -> syn::Result<Vec<Finding>> {
             });
         }
     }
-    impl<'ast> Visit<'ast> for Loops {
+    impl<'ast> Visit<'ast> for Loops<'_> {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = &*node.func
+                && path.qself.is_none()
+            {
+                let mut name = symbols::path_name(&path.path);
+                if name.starts_with("Self::")
+                    && let Some(owner) = &self.owner
+                {
+                    name = format!("{}::{}", owner, &name[6..]);
+                }
+                let key = if self.functions.functions.contains_key(&name) {
+                    Some(name.clone())
+                } else {
+                    self.functions.resolve(&self.module, &name)
+                };
+                if let Some(key) = key {
+                    self.call(&key, node.paren_token.span.open());
+                }
+            }
+            visit::visit_expr_call(self, node);
+        }
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            if matches!(
+                node.method.to_string().as_str(),
+                "collect"
+                    | "sum"
+                    | "product"
+                    | "count"
+                    | "for_each"
+                    | "fold"
+                    | "reduce"
+                    | "any"
+                    | "all"
+                    | "find"
+                    | "position"
+            ) && iterator_chain(&node.receiver)
+            {
+                let traversal = iterator_degree(&node.receiver);
+                self.depth += traversal;
+                self.max_depth = self.max_depth.max(self.depth);
+                self.findings.push(Finding {
+                    line: node.method.span().start().line,
+                    message: format!("iterator consumption may grow as {}", order(self.depth)),
+                });
+                self.visit_chain(&node.receiver);
+                for arg in &node.args {
+                    self.visit_callback(arg);
+                }
+                self.depth -= traversal;
+            } else {
+                if let syn::Expr::Path(receiver) = &*node.receiver
+                    && let Some(ident) = receiver.path.get_ident()
+                    && let Some(owner) = self.types.get(&ident.to_string())
+                {
+                    let key = format!("{owner}::{}", node.method);
+                    self.call(&key, node.method.span());
+                }
+                visit::visit_expr_method_call(self, node);
+            }
+        }
+
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            let old = self.module.clone();
+            self.module = format!("{}::{}", old, node.ident);
+            visit::visit_item_mod(self, node);
+            self.module = old;
+        }
+        fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+            let old = self.owner.clone();
+            self.owner = type_name(&node.self_ty).map(|n| self.functions.qualify(&self.module, &n));
+            visit::visit_item_impl(self, node);
+            self.owner = old;
+        }
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            let old = self.types.clone();
+            visit::visit_block(self, node);
+            self.types = old;
+        }
+        fn visit_local(&mut self, node: &'ast syn::Local) {
+            visit::visit_local(self, node);
+            match &node.pat {
+                syn::Pat::Type(p) => {
+                    if let syn::Pat::Ident(i) = &*p.pat {
+                        self.types.remove(&i.ident.to_string());
+                        if let Some(t) = type_name(&p.ty) {
+                            self.types.insert(
+                                i.ident.to_string(),
+                                self.functions.qualify(&self.module, &t),
+                            );
+                        }
+                    }
+                }
+                syn::Pat::Ident(i) => {
+                    self.types.remove(&i.ident.to_string());
+                }
+                _ => {}
+            }
+        }
         // Deferred bodies are analyzed independently of their definition site.
         fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
             let outer = std::mem::replace(&mut self.depth, 0);
+            let outer_max = self.max_depth;
+            let outer_recursive = self.recursive;
             visit::visit_expr_closure(self, node);
             self.depth = outer;
+            self.max_depth = outer_max;
+            self.recursive = outer_recursive;
         }
         fn visit_expr_async(&mut self, node: &'ast syn::ExprAsync) {
             let outer = std::mem::replace(&mut self.depth, 0);
+            let outer_max = self.max_depth;
+            let outer_recursive = self.recursive;
             visit::visit_expr_async(self, node);
             self.depth = outer;
+            self.max_depth = outer_max;
+            self.recursive = outer_recursive;
         }
         fn visit_expr_repeat(&mut self, node: &'ast syn::ExprRepeat) {
             for attribute in &node.attrs {
@@ -190,14 +425,22 @@ fn try_analyze(source: &str) -> syn::Result<Vec<Finding>> {
             }
             self.visit_expr(&node.expr);
             let outer = std::mem::replace(&mut self.depth, 0);
+            let outer_max = self.max_depth;
+            let outer_recursive = self.recursive;
             self.visit_expr(&node.len);
             self.depth = outer;
+            self.max_depth = outer_max;
+            self.recursive = outer_recursive;
         }
         fn visit_generic_argument(&mut self, node: &'ast syn::GenericArgument) {
             if let syn::GenericArgument::Const(expression) = node {
                 let outer = std::mem::replace(&mut self.depth, 0);
+                let outer_max = self.max_depth;
+                let outer_recursive = self.recursive;
                 self.visit_expr(expression);
                 self.depth = outer;
+                self.max_depth = outer_max;
+                self.recursive = outer_recursive;
             } else {
                 visit::visit_generic_argument(self, node);
             }
@@ -205,54 +448,107 @@ fn try_analyze(source: &str) -> syn::Result<Vec<Finding>> {
         fn visit_type_array(&mut self, node: &'ast syn::TypeArray) {
             self.visit_type(&node.elem);
             let outer = std::mem::replace(&mut self.depth, 0);
+            let outer_max = self.max_depth;
+            let outer_recursive = self.recursive;
             self.visit_expr(&node.len);
             self.depth = outer;
+            self.max_depth = outer_max;
+            self.recursive = outer_recursive;
         }
         fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
             let outer = std::mem::replace(&mut self.depth, 0);
+            let outer_max = self.max_depth;
+            let outer_recursive = self.recursive;
             visit::visit_item_const(self, node);
             self.depth = outer;
+            self.max_depth = outer_max;
+            self.recursive = outer_recursive;
         }
         fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
             let outer = std::mem::replace(&mut self.depth, 0);
+            let outer_max = self.max_depth;
+            let outer_recursive = self.recursive;
             visit::visit_item_static(self, node);
             self.depth = outer;
+            self.max_depth = outer_max;
+            self.recursive = outer_recursive;
         }
         fn visit_expr_const(&mut self, node: &'ast syn::ExprConst) {
             let outer = std::mem::replace(&mut self.depth, 0);
+            let outer_max = self.max_depth;
+            let outer_recursive = self.recursive;
             visit::visit_expr_const(self, node);
             self.depth = outer;
+            self.max_depth = outer_max;
+            self.recursive = outer_recursive;
         }
         fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
             let outer = std::mem::replace(&mut self.depth, 0);
+            let outer_max = self.max_depth;
+            let outer_recursive = self.recursive;
             visit::visit_impl_item_const(self, node);
             self.depth = outer;
+            self.max_depth = outer_max;
+            self.recursive = outer_recursive;
         }
         fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
             let outer = std::mem::replace(&mut self.depth, 0);
+            let outer_max = self.max_depth;
+            let outer_recursive = self.recursive;
             visit::visit_trait_item_const(self, node);
             self.depth = outer;
+            self.max_depth = outer_max;
+            self.recursive = outer_recursive;
         }
         fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
             let outer = std::mem::replace(&mut self.depth, 0);
+            let outer_max = self.max_depth;
+            let outer_recursive = self.recursive;
+            let old_types = self.types.clone();
+            self.bind_signature(&node.sig);
             visit::visit_impl_item_fn(self, node);
+            self.types = old_types;
             self.depth = outer;
+            self.max_depth = outer_max;
+            self.recursive = outer_recursive;
         }
         fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
             let outer = std::mem::replace(&mut self.depth, 0);
+            let outer_max = self.max_depth;
+            let outer_recursive = self.recursive;
             visit::visit_trait_item_fn(self, node);
             self.depth = outer;
+            self.max_depth = outer_max;
+            self.recursive = outer_recursive;
         }
         fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
             let outer = std::mem::replace(&mut self.depth, 0);
+            let outer_max = self.max_depth;
+            let outer_recursive = self.recursive;
+            let old_types = self.types.clone();
+            self.bind_signature(&node.sig);
             visit::visit_item_fn(self, node);
+            self.types = old_types;
             self.depth = outer;
+            self.max_depth = outer_max;
+            self.recursive = outer_recursive;
         }
         fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
-            self.visit_expr(&node.expr);
-            self.enter(node.for_token.span);
+            let extra = if iterator_chain(&node.expr) {
+                iterator_degree(&node.expr) - 1
+            } else {
+                0
+            };
+            if iterator_chain(&node.expr) {
+                self.depth += extra;
+                self.enter(node.for_token.span);
+                self.visit_chain(&node.expr);
+            } else {
+                self.visit_expr(&node.expr);
+                self.enter(node.for_token.span);
+            }
             self.visit_block(&node.body);
-            self.depth -= 1;
+            self.depth -= 1 + extra;
         }
         fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
             self.enter(node.while_token.span);
@@ -265,19 +561,79 @@ fn try_analyze(source: &str) -> syn::Result<Vec<Finding>> {
             self.depth -= 1;
         }
     }
+    let parsed = syn::parse_file(source);
+    let local = parsed
+        .as_ref()
+        .map(symbols::Index::single)
+        .unwrap_or_default();
+    let (functions, module) = context.unwrap_or((&local, "root"));
     let mut visitor = Loops {
+        functions,
+        module: module.into(),
+        owner: None,
+        types: Default::default(),
+        recursive: false,
+        active: Vec::new(),
+        max_depth: 0,
         depth: 0,
         findings: Vec::new(),
     };
-    match syn::parse_file(source) {
-        Ok(file) => visitor.visit_file(&file),
+    match &parsed {
+        Ok(file) => visitor.visit_file(file),
         Err(error) => {
-            let block =
-                syn::parse_str::<syn::Block>(&format!("{{{source}}}")).map_err(|_| error)?;
+            let block = syn::parse_str::<syn::Block>(&format!("{{{source}}}"))
+                .map_err(|_| error.clone())?;
             visitor.visit_block(&block);
         }
     }
     Ok(visitor.findings)
+}
+
+fn type_name(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Reference(r) => type_name(&r.elem),
+        syn::Type::Path(p) if p.qself.is_none() => Some(symbols::path_name(&p.path)),
+        _ => None,
+    }
+}
+fn iterator_degree(expr: &syn::Expr) -> usize {
+    match expr {
+        syn::Expr::MethodCall(c) if iterator_chain(&c.receiver) => {
+            iterator_degree(&c.receiver)
+                + usize::from(matches!(
+                    c.method.to_string().as_str(),
+                    "flat_map" | "flatten"
+                ))
+        }
+        syn::Expr::Paren(p) => iterator_degree(&p.expr),
+        _ => 1,
+    }
+}
+
+fn order(degree: usize) -> String {
+    if degree == 1 {
+        "O(N)".into()
+    } else {
+        format!("O(N^{degree})")
+    }
+}
+
+// Only recognize explicit iterator origins; arbitrary methods named `count`
+// or `collect` are not sufficient evidence of iteration.
+fn iterator_chain(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Range(_) => true,
+        syn::Expr::MethodCall(call) => match call.method.to_string().as_str() {
+            "iter" | "iter_mut" | "into_iter" => true,
+            "flat_map" | "flatten" | "map" | "filter" | "filter_map" | "inspect" | "enumerate"
+            | "take" | "skip" | "take_while" | "skip_while" | "copied" | "cloned" | "rev" => {
+                iterator_chain(&call.receiver)
+            }
+            _ => false,
+        },
+        syn::Expr::Paren(expr) => iterator_chain(&expr.expr),
+        _ => false,
+    }
 }
 
 #[allow(dead_code)]
@@ -452,6 +808,137 @@ fn looks_like_char_literal(chars: &[char], index: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resolves_modules_aliases_and_typed_methods() {
+        let findings = analyze(
+            "mod work { pub fn scan(xs: &[u8]) { for _ in xs {} } } use crate::work::scan as run; struct Worker; impl Worker { fn scan(&self, xs: &[u8]) { work::scan(xs); } } fn caller(w: &Worker, xs: &[u8]) { for _ in xs { run(xs); w.scan(xs); } }",
+        );
+        assert!(
+            findings
+                .iter()
+                .filter(|f| f.message == "call to scan may grow as O(N^2)")
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn flat_map_and_flatten_expand_consumed_cardinality() {
+        for chain in ["xs.iter().flat_map(|_| xs.iter())", "xs.iter().flatten()"] {
+            let findings = analyze(&format!("fn f() {{ {chain}.count(); }}"));
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.message == "iterator consumption may grow as O(N^2)")
+            );
+            assert!(analyze(&format!("fn f() {{ let unused = {chain}; }}")).is_empty());
+        }
+        let findings =
+            analyze("fn f() { for x in xs.iter().flat_map(|_| ys.iter()) { for y in zs {} } }");
+        assert!(findings.iter().any(|f| f.message.contains("O(N^3)")));
+    }
+
+    #[test]
+    fn recursive_risk_and_candidate_propagate_to_callers() {
+        let findings =
+            analyze("fn a() { for _ in xs { b(); } } fn b() { a(); } fn caller() { a(); }");
+        assert!(findings.iter().any(|f| {
+            f.message
+                .contains("potential O(N^2) or worse if recursion depth scales with N")
+        }));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.starts_with("call to a may grow"))
+        );
+    }
+
+    #[test]
+    fn recursion_candidates_explain_assumptions() {
+        let linear =
+            analyze("fn walk(n: usize) { if n > 0 { walk(n - 1); } } fn caller() { walk(10); }");
+        assert!(
+            linear
+                .iter()
+                .any(|f| f.message.contains("potential O(N) or worse"))
+        );
+        assert!(
+            !linear
+                .iter()
+                .any(|f| f.message.contains("potential O(N^2)"))
+        );
+        let quadratic = analyze(
+            "fn walk(n: usize) { for _ in 0..n {} if n > 0 { walk(n - 1); } } fn caller() { walk(10); }",
+        );
+        assert!(
+            quadratic
+                .iter()
+                .any(|f| f.message.contains("potential O(N^2) or worse"))
+        );
+        let halving = analyze("fn walk(n: usize) { if n > 1 { walk(n / 2); } }");
+        assert!(
+            halving
+                .iter()
+                .filter(|f| f.message.contains("potential"))
+                .all(|f| f.message.contains("if recursion depth scales with N"))
+        );
+    }
+
+    #[test]
+    fn same_names_in_different_modules_do_not_collide() {
+        let findings = analyze(
+            "mod a { fn scan() { for _ in xs {} } fn run() { scan(); } } mod b { fn scan() {} fn run() { scan(); } }",
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.message.starts_with("call to scan"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn propagates_transitive_calls_and_iterator_callbacks() {
+        let findings = analyze(
+            "fn leaf(xs: &[u8]) { for _ in xs {} } fn mid(xs: &[u8]) { leaf(xs); } fn outer(xs: &[u8]) { xs.iter().map(|x| { mid(xs); x }).count(); }",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message == "call to leaf may grow as O(N)")
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message == "call to mid may grow as O(N^2)")
+        );
+    }
+
+    #[test]
+    fn iterator_adaptors_are_lazy_and_fused() {
+        assert!(
+            analyze("fn f(xs: &[u8]) { let _ = xs.iter().map(|x| x).filter(|x| true); }")
+                .is_empty()
+        );
+        let findings =
+            analyze("fn f(xs: &[u8]) { xs.iter().map(|x| x).filter(|x| true).count(); }");
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.ends_with("O(N)"));
+        let findings =
+            analyze("fn f(xs: &[u8]) { xs.iter().for_each(|_| { xs.iter().count(); }); }");
+        assert!(findings.iter().any(|f| f.message.ends_with("O(N^2)")));
+    }
+
+    #[test]
+    fn recursive_calls_terminate_and_unused_closures_do_not_inflate_calls() {
+        analyze("fn a() { b(); } fn b() { a(); }");
+        let findings = analyze(
+            "fn helper(xs: &[u8]) { let unused = || { for _ in xs {} }; } fn caller(xs: &[u8]) { helper(xs); }",
+        );
+        assert!(!findings.iter().any(|f| f.message.starts_with("call to")));
+    }
+
     #[test]
     fn array_lengths_and_const_arguments_have_independent_depth() {
         let value = "{ let mut i = 0; while i < 4 { i += 1; } i }";

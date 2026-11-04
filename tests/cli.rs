@@ -98,3 +98,39 @@ fn fifo_does_not_block_cli() {
     fs::remove_dir_all(dir).unwrap();
     assert!(status.success());
 }
+
+#[test]
+fn follows_calls_across_module_files() {
+    let dir = std::env::temp_dir().join(format!("nayuta-modules-{}", std::process::id()));
+    fs::create_dir_all(dir.join("worker")).unwrap();
+    fs::write(
+        dir.join("main.rs"),
+        "mod worker; use crate::worker::scan as run; fn main() { for _ in xs { run(); } }",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("worker.rs"),
+        "mod inner; pub fn scan() { inner::scan(); }",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("worker/inner.rs"),
+        "pub fn scan() { for _ in xs {} }",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_nayuta"))
+        .arg("--fail")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    fs::remove_dir_all(dir).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("main.rs:1:")
+                && line.contains("call to scan may grow as O(N^2)")),
+        "{stdout}"
+    );
+}

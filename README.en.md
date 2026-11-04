@@ -61,8 +61,16 @@ See the [perf mem documentation](https://manpages.debian.org/trixie/linux-perf/p
 
 Static analysis uses heuristics based on Rust syntax trees. It does not distinguish fixed-count loops from input-dependent loops, so use findings as starting points for code review rather than proven complexity bounds.
 
-Iterator chains, recursion, and complexity across function calls are not analyzed. Functions, methods, and supported constant-evaluation contexts are analyzed with independent loop depths.
+Functions, methods, and supported constant-evaluation contexts are analyzed with independent loop depths. Supported call and iterator analysis is described below.
 
 ## License
 
 [MIT](LICENSE)
+
+### Call and iterator analysis
+
+Direct synchronous calls are followed transitively across scanned module files. Standard `mod` declarations, inline modules, `crate`/`self`/`super` paths and explicit `use` aliases are supported. Inherent methods are resolved for explicitly typed parameters/local variables and `self`. Consumed chains starting with `iter`, `iter_mut`, or `into_iter` support adapters such as `map` and `filter`, and consumers such as `collect`, `sum`, `count`, and `for_each`. Adapters share one traversal; callback loops and direct calls contribute additional work. Lazy chains alone are not counted as traversals.
+
+`flat_map` and `flatten` add one degree per expansion, assuming each inner sequence also scales with N. Direct and mutual recursion propagate a conditional risk candidate to callers: for example, `potential O(N^2) or worse if recursion depth scales with N` when linear traversal is present. Recursion without traversal starts at an O(N) candidate. This assumes linear recursion depth; it is not a proven upper or lower bound and may not apply to halving recurrences; recurrence solving and termination proofs are not implemented.
+
+External crates, trait dispatch, type inference, glob imports, chained re-exports, `#[path]`, cfg evaluation, function pointers, function-name shadowing and iterator variables are unsupported. Only scanned files are indexed. Ambiguous definitions are not selected, and unresolved call costs are not composed.

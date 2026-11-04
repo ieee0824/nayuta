@@ -4,11 +4,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 mod memory;
 mod symbols;
+mod worklist;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Finding {
     line: usize,
     message: String,
+    conditional: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,11 +99,17 @@ fn main() -> ExitCode {
                     }
                 };
                 for finding in findings {
+                    let caveat = if finding.conditional {
+                        ""
+                    } else {
+                        " (syntactic heuristic; assumes independent N-sized iterations; amortization and deduplication are not analyzed)"
+                    };
                     println!(
-                        "{}:{}: complexity: {} (syntactic heuristic; assumes independent N-sized iterations; amortization and deduplication are not analyzed)",
+                        "{}:{}: complexity: {}{}",
                         file.display(),
                         finding.line,
-                        finding.message
+                        finding.message,
+                        caveat
                     );
                     count += 1;
                 }
@@ -217,6 +225,7 @@ fn analyze_with_index(
             if self.active.iter().any(|x| x == key) {
                 self.recursive = true;
                 self.findings.push(Finding {
+                    conditional: false,
                     line: span.start().line,
                     message: format!(
                         "recursive call to {key}; recursion risk (see caller estimate)"
@@ -244,6 +253,7 @@ fn analyze_with_index(
                 let work_degree = self.depth + callee.max_depth;
                 self.max_depth = self.max_depth.max(work_degree);
                 self.findings.push(Finding {
+                    conditional: false,
                     line: span.start().line,
                     message: format!(
                         "call to {key} reaches recursion; potential {} or worse if recursion depth scales with N (heuristic, not a proven bound)",
@@ -255,6 +265,7 @@ fn analyze_with_index(
                 self.max_depth = self.max_depth.max(degree);
                 let name = key.rsplit("::").next().unwrap();
                 self.findings.push(Finding {
+                    conditional: false,
                     line: span.start().line,
                     message: format!("call to {name} may grow as {}", order(degree)),
                 });
@@ -289,6 +300,7 @@ fn analyze_with_index(
             self.depth += 1;
             self.max_depth = self.max_depth.max(self.depth);
             self.findings.push(Finding {
+                conditional: false,
                 line: span.start().line,
                 message: if self.depth == 1 {
                     "loop may grow as O(N)".into()
@@ -344,6 +356,7 @@ fn analyze_with_index(
                 self.depth += traversal;
                 self.max_depth = self.max_depth.max(self.depth);
                 self.findings.push(Finding {
+                    conditional: false,
                     line: node.method.span().start().line,
                     message: format!("iterator consumption may grow as {}", order(self.depth)),
                 });
@@ -580,7 +593,14 @@ fn analyze_with_index(
         findings: Vec::new(),
     };
     match &parsed {
-        Ok(file) => visitor.visit_file(file),
+        Ok(file) => {
+            visitor.visit_file(file);
+            // Parent modules can bring macros into scope; the closed-grammar
+            // recognizer only resolves names at a scanned root.
+            if !module.contains("::") {
+                visitor.findings.extend(worklist::analyze(file));
+            }
+        }
         Err(error) => {
             let block = syn::parse_str::<syn::Block>(&format!("{{{source}}}"))
                 .map_err(|_| error.clone())?;
@@ -656,6 +676,7 @@ fn legacy_analyze(source: &str) -> Vec<Finding> {
                 let loop_depth = parent_depth + usize::from(starts_loop);
                 if starts_loop {
                     findings.push(Finding {
+                    conditional: false,
                         line: token.line,
                         message: if loop_depth == 1 {
                             "loop may grow as O(N)".to_owned()
